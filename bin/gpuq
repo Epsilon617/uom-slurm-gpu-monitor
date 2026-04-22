@@ -1,0 +1,868 @@
+#!/usr/bin/env bash
+
+# UoM Slurm GPU Monitor
+# Live Slurm summary for gpuL/gpuA plus the current user's job table.
+
+set -u
+
+DEFAULT_INTERVAL=5
+PARTITIONS=("gpuL" "gpuA")
+
+interval="$DEFAULT_INTERVAL"
+mode="live"
+
+usage() {
+  cat <<'EOF'
+Usage:
+  gpuq
+  gpuq 3
+  gpuq -n 3
+  gpuq --view
+
+Options:
+  -n, --interval SEC   Refresh interval in seconds (default: 5)
+  -v, --view           Open one full snapshot in less -R
+  -h, --help           Show this help
+
+Notes:
+  - This is a light wrapper around periodic squeue/sinfo polling.
+  - The "crowded" judgment is only a rough estimate from node states + pending jobs.
+EOF
+}
+
+is_integer() {
+  [[ "$1" =~ ^[0-9]+$ ]]
+}
+
+gpu_count_from_tres() {
+  local tres="${1:-}"
+
+  if [[ "$tres" =~ (^|,)gres/gpu=([0-9]+) ]]; then
+    printf '%s' "${BASH_REMATCH[2]}"
+  elif [[ "$tres" =~ gres/gpu(:[^:,=]+)*[:=]([0-9]+) ]]; then
+    printf '%s' "${BASH_REMATCH[2]}"
+  else
+    printf '0'
+  fi
+}
+
+tres_count_from_list() {
+  local tres="${1:-}"
+  local key="${2:-}"
+
+  if [[ -n "$key" && "$tres" =~ (^|,)$key=([0-9]+) ]]; then
+    printf '%s' "${BASH_REMATCH[2]}"
+  else
+    printf ''
+  fi
+}
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -n|--interval)
+      shift
+      [[ $# -gt 0 ]] || { echo "Missing value for --interval" >&2; exit 1; }
+      interval="$1"
+      ;;
+    -v|--view)
+      mode="view"
+      ;;
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    *)
+      if is_integer "$1"; then
+        interval="$1"
+      else
+        echo "Unknown argument: $1" >&2
+        usage >&2
+        exit 1
+      fi
+      ;;
+  esac
+  shift
+done
+
+if ! is_integer "$interval" || [[ "$interval" -lt 1 ]]; then
+  echo "Interval must be a positive integer." >&2
+  exit 1
+fi
+
+# Runtime dependencies
+for cmd in squeue sinfo awk column sort date id perl tput less mktemp stty; do
+  command -v "$cmd" >/dev/null 2>&1 || {
+    echo "Missing required command: $cmd" >&2
+    exit 1
+  }
+done
+
+partitions_csv=$(IFS=,; echo "${PARTITIONS[*]}")
+quota_raw=$(sacctmgr show qos fatpou01,gpu-free format=Name,MaxTRESPU -Pn 2>/dev/null || true)
+cpu_quota='?'
+gpu_quota='?'
+
+while IFS='|' read -r quota_name quota_tres; do
+  case "$quota_name" in
+    fatpou01)
+      cpu_quota_value=$(tres_count_from_list "$quota_tres" 'cpu')
+      [[ -n "$cpu_quota_value" ]] && cpu_quota="$cpu_quota_value"
+      ;;
+    gpu-free)
+      gpu_quota_value=$(tres_count_from_list "$quota_tres" 'gres/gpu')
+      [[ -n "$gpu_quota_value" ]] && gpu_quota="$gpu_quota_value"
+      ;;
+  esac
+done <<< "$quota_raw"
+
+# Terminal and color state
+tty_mode=0
+color_mode=0
+color_reset=''
+color_gpuA=''
+color_gpuL=''
+color_gpuH=''
+color_multicore=''
+color_serial=''
+color_state_running=''
+color_state_pending=''
+color_reason_dependency=''
+color_reason_dependency_blocked=''
+color_reason_qos=''
+color_reason_resources=''
+color_reason_priority=''
+color_reason_node_unavail=''
+color_title=''
+color_label=''
+color_section=''
+color_table_header=''
+color_divider=''
+color_muted=''
+color_note=''
+color_usage_zero=''
+color_usage_low=''
+color_usage_high=''
+color_usage_full=''
+color_status_idle=''
+color_status_available=''
+color_status_busy=''
+color_status_slightly_busy=''
+color_status_crowded=''
+color_status_very_crowded=''
+color_status_unavailable=''
+color_status_no_nodes=''
+term_enter_ca=''
+term_exit_ca=''
+term_hide_cursor=''
+term_show_cursor=''
+term_home=''
+term_clear_to_end=''
+term_clear_line=''
+stty_saved=''
+terminal_state_active=0
+cleanup_done=0
+previous_frame_line_count=0
+
+if [[ -t 1 ]]; then
+  tty_mode=1
+  term_enter_ca=$(tput smcup 2>/dev/null || printf '\033[?1049h')
+  term_exit_ca=$(tput rmcup 2>/dev/null || printf '\033[?1049l')
+  term_hide_cursor=$(tput civis 2>/dev/null || printf '\033[?25l')
+  term_show_cursor=$(tput cnorm 2>/dev/null || printf '\033[?25h')
+  term_home=$(tput cup 0 0 2>/dev/null || printf '\033[H')
+  term_clear_to_end=$(tput ed 2>/dev/null || printf '\033[J')
+  term_clear_line=$(tput el 2>/dev/null || printf '\033[K')
+
+  if [[ -z "${GPUQ_NO_COLOR:-}" ]] && [[ "${TERM:-}" != "dumb" ]]; then
+    if colors_supported=$(tput colors 2>/dev/null); then
+      if [[ "$colors_supported" -ge 8 ]]; then
+        color_mode=1
+        color_reset=$'\033[0m'
+        color_gpuA=$'\033[38;5;220m'
+        color_gpuL=$'\033[38;5;111m'
+        color_gpuH=$'\033[38;5;149m'
+        color_multicore=$'\033[38;5;255m'
+        color_serial=$'\033[38;5;245m'
+        color_state_running=$'\033[38;5;40m'
+        color_state_pending=$'\033[38;5;222m'
+        color_reason_dependency=$'\033[38;5;244m'
+        color_reason_dependency_blocked=$'\033[38;5;161m'
+        color_reason_qos=$'\033[38;5;220m'
+        color_reason_resources=$'\033[38;5;208m'
+        color_reason_priority=$'\033[38;5;141m'
+        color_reason_node_unavail=$'\033[38;5;110m'
+        color_title=$'\033[1;38;5;255m'
+        color_label=$'\033[38;5;246m'
+        color_section=$'\033[1;38;5;117m'
+        color_table_header=$'\033[1;38;5;252m'
+        color_divider=$'\033[38;5;239m'
+        color_muted=$'\033[38;5;244m'
+        color_note=$'\033[38;5;243m'
+        color_usage_zero=$'\033[38;5;240m'
+        color_usage_low=$'\033[38;5;40m'
+        color_usage_high=$'\033[38;5;208m'
+        color_usage_full=$'\033[38;5;197m'
+        color_status_idle=$'\033[38;5;111m'
+        color_status_available=$'\033[38;5;149m'
+        color_status_busy=$'\033[38;5;245m'
+        color_status_slightly_busy=$'\033[38;5;215m'
+        color_status_crowded=$'\033[38;5;208m'
+        color_status_very_crowded=$'\033[38;5;197m'
+        color_status_unavailable=$'\033[38;5;141m'
+        color_status_no_nodes=$'\033[38;5;240m'
+      fi
+    fi
+  fi
+
+  stty_saved=$(stty -g 2>/dev/null || true)
+  stty -echo -icanon time 0 min 0 2>/dev/null || true
+  printf '%s%s' "$term_enter_ca" "$term_hide_cursor"
+  terminal_state_active=1
+fi
+
+# Rendering helpers
+apply_colors() {
+  if [[ "$tty_mode" -ne 1 || "$color_mode" -ne 1 ]]; then
+    printf '%s' "$1"
+    return
+  fi
+
+  printf '%s' "$1" | env \
+    PART_COLOR_RESET="$color_reset" \
+    PART_COLOR_GPUA="$color_gpuA" \
+    PART_COLOR_GPUL="$color_gpuL" \
+    PART_COLOR_GPUH="$color_gpuH" \
+    PART_COLOR_MULTICORE="$color_multicore" \
+    PART_COLOR_SERIAL="$color_serial" \
+    PART_COLOR_RUNNING="$color_state_running" \
+    PART_COLOR_PENDING="$color_state_pending" \
+    PART_COLOR_REASON_DEPENDENCY="$color_reason_dependency" \
+    PART_COLOR_REASON_DEPENDENCY_BLOCKED="$color_reason_dependency_blocked" \
+    PART_COLOR_REASON_QOS="$color_reason_qos" \
+    PART_COLOR_REASON_RESOURCES="$color_reason_resources" \
+    PART_COLOR_REASON_PRIORITY="$color_reason_priority" \
+    PART_COLOR_REASON_NODE_UNAVAIL="$color_reason_node_unavail" \
+    PART_COLOR_TITLE="$color_title" \
+    PART_COLOR_LABEL="$color_label" \
+    PART_COLOR_SECTION="$color_section" \
+    PART_COLOR_TABLE_HEADER="$color_table_header" \
+    PART_COLOR_DIVIDER="$color_divider" \
+    PART_COLOR_MUTED="$color_muted" \
+    PART_COLOR_NOTE="$color_note" \
+    PART_COLOR_USAGE_ZERO="$color_usage_zero" \
+    PART_COLOR_USAGE_LOW="$color_usage_low" \
+    PART_COLOR_USAGE_HIGH="$color_usage_high" \
+    PART_COLOR_USAGE_FULL="$color_usage_full" \
+    PART_COLOR_STATUS_IDLE="$color_status_idle" \
+    PART_COLOR_STATUS_AVAILABLE="$color_status_available" \
+    PART_COLOR_STATUS_BUSY="$color_status_busy" \
+    PART_COLOR_STATUS_SLIGHTLY_BUSY="$color_status_slightly_busy" \
+    PART_COLOR_STATUS_CROWDED="$color_status_crowded" \
+    PART_COLOR_STATUS_VERY_CROWDED="$color_status_very_crowded" \
+    PART_COLOR_STATUS_UNAVAILABLE="$color_status_unavailable" \
+    PART_COLOR_STATUS_NO_NODES="$color_status_no_nodes" \
+    perl -pe '
+    s/\bgpuA\b/$ENV{PART_COLOR_GPUA}."gpuA".$ENV{PART_COLOR_RESET}/ge;
+    s/\bgpuL\b/$ENV{PART_COLOR_GPUL}."gpuL".$ENV{PART_COLOR_RESET}/ge;
+    s/\bgpuH\b/$ENV{PART_COLOR_GPUH}."gpuH".$ENV{PART_COLOR_RESET}/ge;
+    s/\b(multicore(?:_\w+)*)\b/$ENV{PART_COLOR_MULTICORE}.$1.$ENV{PART_COLOR_RESET}/ge;
+    s/\b(serial(?:_\w+)*)\b/$ENV{PART_COLOR_SERIAL}.$1.$ENV{PART_COLOR_RESET}/ge;
+    s/\bRUNNING\b/$ENV{PART_COLOR_RUNNING}."RUNNING".$ENV{PART_COLOR_RESET}/ge;
+    s/\bPENDING\b/$ENV{PART_COLOR_PENDING}."PENDING".$ENV{PART_COLOR_RESET}/ge;
+    s/\bDependencyNeverSatisfied\b/$ENV{PART_COLOR_REASON_DEPENDENCY_BLOCKED}."DependencyNeverSatisfied".$ENV{PART_COLOR_RESET}/ge;
+    s/\bReqNodeNotAvail\b/$ENV{PART_COLOR_REASON_NODE_UNAVAIL}."ReqNodeNotAvail".$ENV{PART_COLOR_RESET}/ge;
+    s/\b(Resources|Priority)\b/
+      $1 eq "Resources"
+        ? $ENV{PART_COLOR_REASON_RESOURCES}.$1.$ENV{PART_COLOR_RESET}
+        : $ENV{PART_COLOR_REASON_PRIORITY}.$1.$ENV{PART_COLOR_RESET}
+    /ge;
+    s/\b(QOS\w+|AssocGrp\w+|Max\w+GRES\w*)\b/$ENV{PART_COLOR_REASON_QOS}.$1.$ENV{PART_COLOR_RESET}/ge;
+    s/\bDependency\b/$ENV{PART_COLOR_REASON_DEPENDENCY}."Dependency".$ENV{PART_COLOR_RESET}/ge;
+    s/^SLURM GPU Monitor\b/$ENV{PART_COLOR_TITLE}."SLURM GPU Monitor".$ENV{PART_COLOR_RESET}/e;
+    s/^Partitions:/$ENV{PART_COLOR_LABEL}."Partitions:".$ENV{PART_COLOR_RESET}/e;
+    s/^Pending reason summary$/$ENV{PART_COLOR_SECTION}."Pending reason summary".$ENV{PART_COLOR_RESET}/e;
+    s/^Your jobs \(([^)]+)\)$/$ENV{PART_COLOR_SECTION}."Your jobs". $ENV{PART_COLOR_RESET} ." (".$1.")"/e;
+    s{^Current usage / quota$}{$ENV{PART_COLOR_SECTION}."Current usage / quota".$ENV{PART_COLOR_RESET}}e;
+    s{^Usage\s+CPU\s+(\d+)/(\S+)\s+GPU\s+(\d+)/(\S+)$}{
+      my ($cpu_used, $cpu_quota, $gpu_used, $gpu_quota) = ($1, $2, $3, $4);
+      my $cpu_color = $ENV{PART_COLOR_MUTED};
+      my $gpu_color = $ENV{PART_COLOR_MUTED};
+
+      if ($cpu_quota =~ /^\d+$/ && $cpu_quota > 0) {
+        my $cpu_ratio = $cpu_used / $cpu_quota;
+        $cpu_color =
+          $cpu_used == 0 ? $ENV{PART_COLOR_USAGE_ZERO} :
+          $cpu_ratio >= 1 ? $ENV{PART_COLOR_USAGE_FULL} :
+          $cpu_ratio >= 0.7 ? $ENV{PART_COLOR_USAGE_HIGH} :
+          $ENV{PART_COLOR_USAGE_LOW};
+      } elsif ($cpu_used == 0) {
+        $cpu_color = $ENV{PART_COLOR_USAGE_ZERO};
+      }
+
+      if ($gpu_quota =~ /^\d+$/ && $gpu_quota > 0) {
+        my $gpu_ratio = $gpu_used / $gpu_quota;
+        $gpu_color =
+          $gpu_used == 0 ? $ENV{PART_COLOR_USAGE_ZERO} :
+          $gpu_ratio >= 1 ? $ENV{PART_COLOR_USAGE_FULL} :
+          $gpu_ratio >= 0.7 ? $ENV{PART_COLOR_USAGE_HIGH} :
+          $ENV{PART_COLOR_USAGE_LOW};
+      } elsif ($gpu_used == 0) {
+        $gpu_color = $ENV{PART_COLOR_USAGE_ZERO};
+      }
+
+      "Usage  "
+        .$ENV{PART_COLOR_LABEL}."CPU".$ENV{PART_COLOR_RESET}
+        ." ".$cpu_color.$cpu_used.$ENV{PART_COLOR_RESET}
+        ."/".$ENV{PART_COLOR_MUTED}.$cpu_quota.$ENV{PART_COLOR_RESET}
+        ."  "
+        .$ENV{PART_COLOR_LABEL}."GPU".$ENV{PART_COLOR_RESET}
+        ." ".$gpu_color.$gpu_used.$ENV{PART_COLOR_RESET}
+        ."/".$ENV{PART_COLOR_MUTED}.$gpu_quota.$ENV{PART_COLOR_RESET}
+    }ex;
+    s/^(Showing all \d+ jobs|Showing jobs \d+-\d+ of \d+  scroll: .*)$/$ENV{PART_COLOR_MUTED}.$1.$ENV{PART_COLOR_RESET}/e;
+    s/^(Partition\s+Nodes\(total\)\s+Idle\s+Mix\s+Alloc\s+Drain\s+Down\s+Running jobs\s+Pending jobs\s+Rough status)(\s*)$/$ENV{PART_COLOR_TABLE_HEADER}.$1.$ENV{PART_COLOR_RESET}.$2/e;
+    s/^(JOBID\s+PARTITION\s+STATE\s+TIME\s+LIMIT\s+CPU\s+GPU\s+NODES\s+NODE\/REASON\s+NAME)(\s*)$/$ENV{PART_COLOR_TABLE_HEADER}.$1.$ENV{PART_COLOR_RESET}.$2/e;
+    s{^(CPU|GPU)(\s+)(\d+)(\s+/\s+)(\S+)$}{
+      my ($label, $space, $used, $sep, $quota) = ($1, $2, $3, $4, $5);
+      my $usage_color = $ENV{PART_COLOR_MUTED};
+      if ($quota =~ /^\d+$/ && $quota > 0) {
+        my $ratio = $used / $quota;
+        $usage_color =
+          $used == 0 ? $ENV{PART_COLOR_USAGE_ZERO} :
+          $ratio >= 1 ? $ENV{PART_COLOR_USAGE_FULL} :
+          $ratio >= 0.7 ? $ENV{PART_COLOR_USAGE_HIGH} :
+          $ENV{PART_COLOR_USAGE_LOW};
+      } elsif ($used == 0) {
+        $usage_color = $ENV{PART_COLOR_USAGE_ZERO};
+      }
+      $ENV{PART_COLOR_LABEL}.$label.$ENV{PART_COLOR_RESET}
+        .$space
+        .$usage_color.$used.$ENV{PART_COLOR_RESET}
+        .$sep
+        .$ENV{PART_COLOR_MUTED}.$quota.$ENV{PART_COLOR_RESET}
+    }ex;
+    s/^[-]{8,}$/$ENV{PART_COLOR_DIVIDER}.$&.$ENV{PART_COLOR_RESET}/e;
+    s/\brefresh=\d+s\b/$ENV{PART_COLOR_MUTED}.$&.$ENV{PART_COLOR_RESET}/ge;
+    s/Ctrl-C to quit/$ENV{PART_COLOR_MUTED}."Ctrl-C to quit".$ENV{PART_COLOR_RESET}/ge;
+    s/^Note: rough status is node-level only\. A mix node may still have free GPUs\.$/$ENV{PART_COLOR_NOTE}.$&.$ENV{PART_COLOR_RESET}/e;
+    s/\bvery crowded\b/__GPUQ_STATUS_VERY_CROWDED__/g;
+    s/\bslightly busy\b/__GPUQ_STATUS_SLIGHTLY_BUSY__/g;
+    s/\bno nodes\b/__GPUQ_STATUS_NO_NODES__/g;
+    s/\bidle\b/$ENV{PART_COLOR_STATUS_IDLE}."idle".$ENV{PART_COLOR_RESET}/ge;
+    s/\bavailable\b/$ENV{PART_COLOR_STATUS_AVAILABLE}."available".$ENV{PART_COLOR_RESET}/ge;
+    s/\bbusy\b/$ENV{PART_COLOR_STATUS_BUSY}."busy".$ENV{PART_COLOR_RESET}/ge;
+    s/\bcrowded\b/$ENV{PART_COLOR_STATUS_CROWDED}."crowded".$ENV{PART_COLOR_RESET}/ge;
+    s/\bunavailable\b/$ENV{PART_COLOR_STATUS_UNAVAILABLE}."unavailable".$ENV{PART_COLOR_RESET}/ge;
+    s/__GPUQ_STATUS_VERY_CROWDED__/$ENV{PART_COLOR_STATUS_VERY_CROWDED}."very crowded".$ENV{PART_COLOR_RESET}/ge;
+    s/__GPUQ_STATUS_SLIGHTLY_BUSY__/$ENV{PART_COLOR_STATUS_SLIGHTLY_BUSY}."slightly busy".$ENV{PART_COLOR_RESET}/ge;
+    s/__GPUQ_STATUS_NO_NODES__/$ENV{PART_COLOR_STATUS_NO_NODES}."no nodes".$ENV{PART_COLOR_RESET}/ge;
+    s/__GPUQ_PART_GPUL__/$ENV{PART_COLOR_GPUL}."gpuL".$ENV{PART_COLOR_RESET}/ge;
+    s/__GPUQ_PART_GPUA__/$ENV{PART_COLOR_GPUA}."gpuA".$ENV{PART_COLOR_RESET}/ge;
+    s/__GPUQ_PART_GPUH__/$ENV{PART_COLOR_GPUH}."gpuH".$ENV{PART_COLOR_RESET}/ge;
+    s/__GPUQ_RUN\[\[(\d+)\]\]__/$ENV{PART_COLOR_RUNNING}.$1.$ENV{PART_COLOR_RESET}/ge;
+    s/__GPUQ_PENDING\[\[(\d+)\]\]__/$ENV{PART_COLOR_PENDING}.$1.$ENV{PART_COLOR_RESET}/ge;
+    s/__GPUQ_STATUS_IDLE__/$ENV{PART_COLOR_STATUS_IDLE}."idle".$ENV{PART_COLOR_RESET}/ge;
+    s/__GPUQ_STATUS_AVAILABLE__/$ENV{PART_COLOR_STATUS_AVAILABLE}."available".$ENV{PART_COLOR_RESET}/ge;
+    s/__GPUQ_STATUS_BUSY__/$ENV{PART_COLOR_STATUS_BUSY}."busy".$ENV{PART_COLOR_RESET}/ge;
+    s/__GPUQ_STATUS_SLIGHTLY_BUSY__/$ENV{PART_COLOR_STATUS_SLIGHTLY_BUSY}."slightly busy".$ENV{PART_COLOR_RESET}/ge;
+    s/__GPUQ_STATUS_CROWDED__/$ENV{PART_COLOR_STATUS_CROWDED}."crowded".$ENV{PART_COLOR_RESET}/ge;
+    s/__GPUQ_STATUS_VERY_CROWDED__/$ENV{PART_COLOR_STATUS_VERY_CROWDED}."very crowded".$ENV{PART_COLOR_RESET}/ge;
+    s/__GPUQ_STATUS_UNAVAILABLE__/$ENV{PART_COLOR_STATUS_UNAVAILABLE}."unavailable".$ENV{PART_COLOR_RESET}/ge;
+    s/__GPUQ_STATUS_NO_NODES__/$ENV{PART_COLOR_STATUS_NO_NODES}."no nodes".$ENV{PART_COLOR_RESET}/ge;
+  '
+}
+
+# Layout helpers
+pad_right_rendered() {
+  local raw="$1"
+  local width="$2"
+  local rendered="${3:-$1}"
+  local pad=$(( width - ${#raw} ))
+  if [[ "$pad" -lt 0 ]]; then
+    pad=0
+  fi
+  printf '%s%*s' "$rendered" "$pad" ''
+}
+
+pad_left_rendered() {
+  local raw="$1"
+  local width="$2"
+  local rendered="${3:-$1}"
+  local pad=$(( width - ${#raw} ))
+  if [[ "$pad" -lt 0 ]]; then
+    pad=0
+  fi
+  printf '%*s%s' "$pad" '' "$rendered"
+}
+
+line_count() {
+  local text="${1:-}"
+  if [[ -z "$text" ]]; then
+    printf '0'
+  else
+    printf '%s' "$text" | awk 'END { print NR }'
+  fi
+}
+
+drain_stdin() {
+  local discard=''
+
+  if [[ "$tty_mode" -ne 1 || "$terminal_state_active" -ne 1 ]]; then
+    return
+  fi
+
+  while IFS= read -rsn1 -t 0 discard; do
+    :
+  done
+}
+
+# Cleanup and process lifecycle
+restore_terminal() {
+  if [[ "$cleanup_done" -eq 1 ]]; then
+    return
+  fi
+  cleanup_done=1
+
+  if [[ "$tty_mode" -eq 1 && "$terminal_state_active" -eq 1 ]]; then
+    drain_stdin
+    [[ -n "$stty_saved" ]] && stty "$stty_saved" 2>/dev/null || true
+    printf '%s%s%s' "$term_show_cursor" "$color_reset" "$term_exit_ca"
+    terminal_state_active=0
+  fi
+}
+
+cleanup() {
+  restore_terminal
+  printf '\n'
+  exit "${1:-0}"
+}
+
+trap 'cleanup 130' INT TERM HUP QUIT
+trap 'restore_terminal' EXIT
+
+# Core render path
+render_once() {
+  local now sinfo_raw squeue_raw queue_table user_jobs current_user frame divider divider_width summary_table user_tres_raw
+  local -A total idle mix alloc drain down running pending reason_counts job_gpus
+  local part nodes state usable total_n idle_n mix_n alloc_n drain_n down_n running_n pending_n status
+  local jobid user partition job_state time_used time_limit node_count reason name key matches cpu_count gres_req gpu_count tres_jobid tres_alloc
+  local cpu_used gpu_used jobs_header jobs_footer user_jobs_table refresh_label control_hint
+  local part_token running_token pending_token status_token
+  local jobs_meta base_lines footer_lines header_lines term_lines end_line visible_rows idx visible_job_count
+  local table_header_line reason_limit reason_total reason_hidden shown_matches
+  local frame_line_count extra_clear_lines
+  local -a user_job_lines visible_job_lines frame_lines
+  now=$(date '+%Y-%m-%d %H:%M:%S %Z')
+  current_user=$(id -un)
+  divider_width=88
+  term_lines=40
+  if [[ "$tty_mode" -eq 1 ]]; then
+    divider_width=$(tput cols 2>/dev/null || echo 88)
+    term_lines=$(tput lines 2>/dev/null || echo 40)
+    if [[ "$divider_width" -gt 100 ]]; then
+      divider_width=100
+    elif [[ "$divider_width" -lt 48 ]]; then
+      divider_width=48
+    fi
+  fi
+  reason_limit=99
+  if [[ "$tty_mode" -eq 1 && "$mode" == "live" ]]; then
+    if [[ "$term_lines" -le 32 ]]; then
+      reason_limit=1
+    elif [[ "$term_lines" -le 40 ]]; then
+      reason_limit=2
+    elif [[ "$term_lines" -le 50 ]]; then
+      reason_limit=3
+    else
+      reason_limit=4
+    fi
+  fi
+  divider=$(printf '%*s' "$divider_width" '' | tr ' ' '-')
+
+  sinfo_raw=$(sinfo -h -p "$partitions_csv" -o '%P|%D|%t' 2>&1)
+  if [[ $? -ne 0 ]]; then
+    echo "sinfo failed:"
+    echo "$sinfo_raw"
+    return
+  fi
+
+  squeue_raw=$(squeue -h -o '%i|%u|%P|%T|%M|%l|%D|%R|%j|%C|%b' 2>&1)
+  if [[ $? -ne 0 ]]; then
+    echo "squeue failed:"
+    echo "$squeue_raw"
+    return
+  fi
+
+  user_tres_raw=$(squeue -h -u "$current_user" -O jobid:30,tres-alloc:240 2>/dev/null | awk '
+    {
+      id = $1
+      $1 = ""
+      sub(/^ +/, "")
+      sub(/ +$/, "")
+      print id "|" $0
+    }
+  ')
+
+  while IFS='|' read -r tres_jobid tres_alloc; do
+    [[ -n "$tres_jobid" ]] || continue
+    job_gpus["$tres_jobid"]=$(gpu_count_from_tres "$tres_alloc")
+  done <<< "$user_tres_raw"
+
+  while IFS='|' read -r part nodes state; do
+    [[ -n "$part" ]] || continue
+    part=${part%%\**}
+    case "$part" in
+      gpuL|gpuA) ;;
+      *) continue ;;
+    esac
+
+    nodes=${nodes//[[:space:]]/}
+    state=${state//[[:space:]]/}
+    total["$part"]=$(( ${total["$part"]:-0} + nodes ))
+
+    case "$state" in
+      idle*) idle["$part"]=$(( ${idle["$part"]:-0} + nodes )) ;;
+      mix*) mix["$part"]=$(( ${mix["$part"]:-0} + nodes )) ;;
+      alloc*) alloc["$part"]=$(( ${alloc["$part"]:-0} + nodes )) ;;
+      drain*) drain["$part"]=$(( ${drain["$part"]:-0} + nodes )) ;;
+      down*) down["$part"]=$(( ${down["$part"]:-0} + nodes )) ;;
+    esac
+  done <<< "$sinfo_raw"
+
+  queue_table=$(printf '%s\n' "$squeue_raw" | awk -F'|' '$3 == "gpuL" || $3 == "gpuA" { print }')
+
+  while IFS='|' read -r jobid user partition job_state time_used time_limit node_count reason name cpu_count gres_req; do
+    [[ -n "$partition" ]] || continue
+    partition=${partition%%\**}
+
+    case "$job_state" in
+      RUNNING) running["$partition"]=$(( ${running["$partition"]:-0} + 1 )) ;;
+      PENDING)
+        pending["$partition"]=$(( ${pending["$partition"]:-0} + 1 ))
+        key="${partition}|${reason}"
+        reason_counts["$key"]=$(( ${reason_counts["$key"]:-0} + 1 ))
+        ;;
+    esac
+  done <<< "$queue_table"
+
+  cpu_used=0
+  gpu_used=0
+  while IFS='|' read -r jobid user partition job_state time_used time_limit node_count reason name cpu_count gres_req; do
+    [[ "$user" == "$current_user" && "$job_state" == "RUNNING" ]] || continue
+    cpu_count=${cpu_count:-0}
+    gpu_count=${job_gpus["$jobid"]:-}
+    if [[ -z "$gpu_count" ]]; then
+      gpu_count=$(gpu_count_from_tres "$gres_req")
+    fi
+    [[ "$cpu_count" =~ ^[0-9]+$ ]] || cpu_count=0
+    [[ "$gpu_count" =~ ^[0-9]+$ ]] || gpu_count=0
+    cpu_used=$(( cpu_used + cpu_count ))
+    gpu_used=$(( gpu_used + gpu_count ))
+  done <<< "$squeue_raw"
+
+  summary_table=$({
+    pad_right_rendered "Partition" 11
+    printf ' '
+    pad_left_rendered "Nodes(total)" 12
+    printf ' '
+    pad_left_rendered "Idle" 5
+    printf ' '
+    pad_left_rendered "Mix" 5
+    printf ' '
+    pad_left_rendered "Alloc" 5
+    printf ' '
+    pad_left_rendered "Drain" 5
+    printf ' '
+    pad_left_rendered "Down" 5
+    printf ' '
+    pad_left_rendered "Running jobs" 12
+    printf ' '
+    pad_left_rendered "Pending jobs" 12
+    printf '  '
+    pad_right_rendered "Rough status" 14
+    printf '\n'
+
+    for part in "${PARTITIONS[@]}"; do
+      total_n=${total["$part"]:-0}
+      idle_n=${idle["$part"]:-0}
+      mix_n=${mix["$part"]:-0}
+      alloc_n=${alloc["$part"]:-0}
+      drain_n=${drain["$part"]:-0}
+      down_n=${down["$part"]:-0}
+      running_n=${running["$part"]:-0}
+      pending_n=${pending["$part"]:-0}
+      usable=$(( total_n - drain_n - down_n ))
+
+      if [[ "$total_n" -eq 0 ]]; then
+        status="no nodes"
+      elif [[ "$usable" -le 0 ]]; then
+        status="unavailable"
+      elif [[ "$idle_n" -gt 0 && "$pending_n" -eq 0 ]]; then
+        status="idle"
+      elif [[ "$idle_n" -gt 0 && "$pending_n" -gt 0 ]]; then
+        status="available"
+      elif [[ "$idle_n" -eq 0 && "$pending_n" -eq 0 && $(( mix_n + alloc_n )) -gt 0 ]]; then
+        status="busy"
+      elif [[ "$idle_n" -eq 0 && "$pending_n" -le 3 ]]; then
+        status="slightly busy"
+      elif [[ "$idle_n" -eq 0 && "$pending_n" -le 10 ]]; then
+        status="crowded"
+      else
+        status="very crowded"
+      fi
+
+      if [[ "$tty_mode" -eq 1 && "$color_mode" -eq 1 ]]; then
+        case "$part" in
+          gpuL) part_token="__GPUQ_PART_GPUL__" ;;
+          gpuA) part_token="__GPUQ_PART_GPUA__" ;;
+          gpuH) part_token="__GPUQ_PART_GPUH__" ;;
+          *) part_token="$part" ;;
+        esac
+        running_token="__GPUQ_RUN[[${running_n}]]__"
+        pending_token="__GPUQ_PENDING[[${pending_n}]]__"
+        case "$status" in
+          idle) status_token="__GPUQ_STATUS_IDLE__" ;;
+          available) status_token="__GPUQ_STATUS_AVAILABLE__" ;;
+          busy) status_token="__GPUQ_STATUS_BUSY__" ;;
+          "slightly busy") status_token="__GPUQ_STATUS_SLIGHTLY_BUSY__" ;;
+          crowded) status_token="__GPUQ_STATUS_CROWDED__" ;;
+          "very crowded") status_token="__GPUQ_STATUS_VERY_CROWDED__" ;;
+          unavailable) status_token="__GPUQ_STATUS_UNAVAILABLE__" ;;
+          "no nodes") status_token="__GPUQ_STATUS_NO_NODES__" ;;
+          *) status_token="$status" ;;
+        esac
+      else
+        part_token="$part"
+        running_token="$running_n"
+        pending_token="$pending_n"
+        status_token="$status"
+      fi
+
+      pad_right_rendered "$part" 11 "$part_token"
+      printf ' '
+      pad_left_rendered "$total_n" 12
+      printf ' '
+      pad_left_rendered "$idle_n" 5
+      printf ' '
+      pad_left_rendered "$mix_n" 5
+      printf ' '
+      pad_left_rendered "$alloc_n" 5
+      printf ' '
+      pad_left_rendered "$drain_n" 5
+      printf ' '
+      pad_left_rendered "$down_n" 5
+      printf ' '
+      pad_left_rendered "$running_n" 12 "$running_token"
+      printf ' '
+      pad_left_rendered "$pending_n" 12 "$pending_token"
+      printf '  '
+      pad_right_rendered "$status" 14 "$status_token"
+      printf '\n'
+    done
+  })
+
+  frame=$({
+    refresh_label="refresh=${interval}s"
+    control_hint="Ctrl-C quit"
+
+    echo "SLURM GPU Monitor  ${now}  ${refresh_label}"
+    echo "Partitions: ${partitions_csv}    ${control_hint}"
+    echo "$divider"
+    printf '%s' "$summary_table"
+  })
+
+  frame+=$'\n'"$divider"$'\n'"Pending reason summary"$'\n'
+  for part in "${PARTITIONS[@]}"; do
+    matches=$(
+      for key in "${!reason_counts[@]}"; do
+        [[ "$key" == "${part}|"* ]] || continue
+        printf '%s|%s\n' "${reason_counts["$key"]}" "${key#*|}"
+      done | sort -t'|' -k1,1nr -k2,2
+    )
+
+    if [[ "$tty_mode" -eq 1 && "$mode" == "live" ]]; then
+      if [[ -n "$matches" ]]; then
+        shown_matches="$matches"
+        shown_matches=$(printf '%s\n' "$shown_matches" | awk -F'|' '{ parts[NR] = $1 " " $2 } END { for (i = 1; i <= NR; i++) { printf "%s%s", parts[i], (i < NR ? ", " : "") } }')
+        frame+="[${part}] ${shown_matches}"$'\n'
+      else
+        frame+="[${part}] 0  no pending jobs"$'\n'
+      fi
+    elif [[ -n "$matches" ]]; then
+      frame+="[${part}]"$'\n'
+      reason_total=$(printf '%s\n' "$matches" | awk 'END { print NR }')
+      shown_matches="$matches"
+      if [[ "$reason_total" -gt "$reason_limit" ]]; then
+        shown_matches=$(printf '%s\n' "$matches" | awk -v limit="$reason_limit" 'NR <= limit')
+      fi
+      frame+="$(printf '%s\n' "$shown_matches" | column -t -s '|')"$'\n'
+      if [[ "$reason_total" -gt "$reason_limit" ]]; then
+        reason_hidden=$(( reason_total - reason_limit ))
+        frame+="... and ${reason_hidden} more"$'\n'
+      fi
+    else
+      frame+="[${part}]"$'\n'
+      frame+="0  no pending jobs"$'\n'
+    fi
+  done
+
+  jobs_header="${divider}"$'\n'"Your jobs (${current_user})"$'\n'
+  user_jobs=$(
+    while IFS='|' read -r jobid user partition job_state time_used time_limit node_count reason name cpu_count gres_req; do
+      [[ "$user" == "$current_user" ]] || continue
+      gpu_count=${job_gpus["$jobid"]:-}
+      if [[ -z "$gpu_count" ]]; then
+        gpu_count=$(gpu_count_from_tres "$gres_req")
+      fi
+      printf '%s|%s|%s|%s|%s|%s|%s|%s|%s|%s\n' \
+        "$jobid" "$partition" "$job_state" "$time_used" "$time_limit" "$cpu_count" "$gpu_count" "$node_count" "$reason" "$name"
+    done <<< "$squeue_raw" | sort -t'|' -k2,2 -k3,3 -k1,1
+  )
+
+  if [[ -n "$user_jobs" ]]; then
+    mapfile -t user_job_lines < <( {
+      echo "JOBID|PARTITION|STATE|TIME|LIMIT|CPU|GPU|NODES|NODE/REASON|NAME"
+      printf '%s\n' "$user_jobs"
+    } | column -t -s '|' )
+
+    visible_job_count=$(( ${#user_job_lines[@]} - 1 ))
+    if [[ "$visible_job_count" -lt 0 ]]; then
+      visible_job_count=0
+    fi
+
+    table_header_line="${user_job_lines[0]}"
+    if [[ "$tty_mode" -eq 1 && "$mode" == "live" ]]; then
+      jobs_footer=$'\n'"$divider"$'\n'"Usage  CPU ${cpu_used}/${cpu_quota}  GPU ${gpu_used}/${gpu_quota}"$'\n'
+
+      footer_lines=$(line_count "$jobs_footer")
+      base_lines=$(line_count "$frame")
+      header_lines=$(( $(line_count "$jobs_header") + 2 ))
+      visible_rows=$(( term_lines - base_lines - header_lines - footer_lines ))
+      if [[ "$visible_rows" -lt 1 ]]; then
+        visible_rows=1
+      fi
+
+      if [[ "$visible_job_count" -eq 0 ]]; then
+        end_line=0
+      else
+        end_line="$visible_rows"
+        if [[ "$end_line" -gt "$visible_job_count" ]]; then
+          end_line=$visible_job_count
+        fi
+      fi
+
+      if [[ "$visible_job_count" -le "$visible_rows" ]]; then
+        jobs_meta="Showing all ${visible_job_count} jobs"
+      else
+        jobs_meta="Showing jobs 1-${end_line} of ${visible_job_count}"
+      fi
+
+      visible_job_lines=()
+      if [[ "$visible_job_count" -gt 0 ]]; then
+        for ((idx = 1; idx <= end_line; idx++)); do
+          visible_job_lines+=("${user_job_lines[idx]}")
+        done
+      fi
+
+      user_jobs_table="$jobs_meta"$'\n'"$table_header_line"
+      if [[ "${#visible_job_lines[@]}" -gt 0 ]]; then
+        user_jobs_table+=$'\n'"$(printf '%s\n' "${visible_job_lines[@]}")"
+      fi
+    else
+      user_jobs_table="$(printf '%s\n' "${user_job_lines[@]}")"
+    fi
+  else
+    user_jobs_table="No jobs found for ${current_user}."
+  fi
+
+  if [[ -z "${jobs_footer:-}" ]]; then
+    jobs_footer=$'\n'"$divider"$'\n'"Current usage / quota"$'\n'
+    jobs_footer+="CPU  ${cpu_used} / ${cpu_quota}"$'\n'
+    jobs_footer+="GPU  ${gpu_used} / ${gpu_quota}"$'\n'
+    jobs_footer+=$'\n'"${divider}"$'\n''Note: rough status is node-level only. A mix node may still have free GPUs.'$'\n'
+  fi
+
+  frame+="$jobs_header"
+  frame+="$user_jobs_table"
+  frame+="$jobs_footer"
+  frame=$(apply_colors "$frame")
+
+  if [[ "$tty_mode" -eq 1 ]]; then
+    mapfile -t frame_lines <<< "$frame"
+    frame_line_count=${#frame_lines[@]}
+
+    printf '%s' "$term_home"
+    if [[ "$frame_line_count" -eq 0 ]]; then
+      printf '%s' "$term_clear_line"
+    else
+      for frame_line in "${frame_lines[@]}"; do
+        printf '%s%s\n' "$frame_line" "$term_clear_line"
+      done
+    fi
+
+    extra_clear_lines=$(( previous_frame_line_count - frame_line_count ))
+    while [[ "$extra_clear_lines" -gt 0 ]]; do
+      printf '%s\n' "$term_clear_line"
+      extra_clear_lines=$(( extra_clear_lines - 1 ))
+    done
+
+    printf '%s' "$term_clear_to_end"
+    previous_frame_line_count=$frame_line_count
+  else
+    printf '%s' "$frame"
+  fi
+}
+
+# Optional one-shot pager mode
+view_in_pager() {
+  local snapshot="$1"
+  local tmp_file
+
+  tmp_file=$(mktemp /tmp/gpuq_snapshot.XXXXXX) || return 1
+  printf '%s' "$snapshot" > "$tmp_file"
+
+  if [[ "$tty_mode" -eq 1 ]]; then
+    drain_stdin
+    [[ -n "$stty_saved" ]] && stty "$stty_saved" 2>/dev/null || true
+    printf '%s%s%s' "$term_show_cursor" "$color_reset" "$term_exit_ca"
+    terminal_state_active=0
+  fi
+
+  less -R "$tmp_file"
+  rm -f "$tmp_file"
+
+  if [[ "$tty_mode" -eq 1 ]]; then
+    stty -echo -icanon time 0 min 0 2>/dev/null || true
+    printf '%s%s' "$term_enter_ca" "$term_hide_cursor"
+    terminal_state_active=1
+    drain_stdin
+  fi
+}
+
+if [[ "$mode" == "view" ]]; then
+  render_once
+  if [[ -n "${frame:-}" ]]; then
+    view_in_pager "$frame"
+  fi
+  cleanup
+fi
+
+# Live refresh loop
+while true; do
+  render_once
+  if [[ "$tty_mode" -eq 1 ]]; then
+    loop_sleep='0.05'
+    next_refresh_epoch=$(( $(date +%s) + interval ))
+    while true; do
+      now_epoch=$(date +%s)
+      if [[ "$now_epoch" -ge "$next_refresh_epoch" ]]; then
+        render_once
+        next_refresh_epoch=$(( now_epoch + interval ))
+      fi
+
+      sleep "$loop_sleep"
+    done
+  else
+    sleep "$interval"
+  fi
+done
