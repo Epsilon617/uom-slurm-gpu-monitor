@@ -1,42 +1,38 @@
 # UoM Slurm GPU Monitor
 
-`gpuq` is a lightweight Slurm dashboard for the University of Manchester HPC environment.
+`gpuq` is a lightweight Slurm dashboard for the University of Manchester HPC environment. It is designed for users who want a compact, low-overhead view of GPU queue pressure and their own active jobs without repeatedly running `squeue` by hand.
 
-It was built for a very specific workflow:
+![Preview](assert/preview.png)
 
-- watch `gpuL` and `gpuA` without hammering the scheduler
-- keep a compact live view that refreshes every few seconds
-- show your own jobs directly under the cluster summary
-- make queue pressure, pending reasons, and current CPU/GPU usage visible at a glance
+The tool focuses on a narrow operational workflow:
 
-The current live mode is intentionally conservative:
+- monitor `gpuL` and `gpuA` with a fixed refresh interval
+- inspect pending reasons at partition level
+- track your own jobs in the same view
+- surface current CPU and GPU usage against quota
 
-- automatic refresh only
-- no live scrolling inside the dashboard
-- full queue browsing is still available through `gpuq --view`
-
-That tradeoff is deliberate. On shared HPC login nodes, a stable read-only dashboard is much more reliable than a shell script pretending to be a full terminal UI.
+The live dashboard intentionally favors stability over interactivity. It uses a read-only refresh model that behaves predictably on shared login nodes and avoids pretending to be a full terminal UI.
 
 ## Features
 
 - live Slurm summary for `gpuL` and `gpuA`
-- Monokai-friendly terminal colors
-- pending reason summaries per partition
-- `Your jobs` table with:
+- Monokai-oriented terminal color scheme
+- partition-level pending reason summaries
+- per-user job table showing:
   - partition
   - state
   - elapsed time
   - time limit
   - CPU count
   - GPU count
-  - node / reason
+  - node or pending reason
   - job name
 - current `CPU used / quota` and `GPU used / quota`
-- one-shot snapshot view with `gpuq --view`
+- one-shot full snapshot mode via `gpuq --view`
 
 ## Requirements
 
-The script expects these commands to exist on the target system:
+The script expects the following commands to be available on the target system:
 
 - `bash`
 - `squeue`
@@ -53,27 +49,29 @@ The script expects these commands to exist on the target system:
 - `mktemp`
 - `stty`
 
-This project is intended for Slurm-based HPC systems. It is not a general cluster monitoring package.
+This project targets Slurm-based HPC systems and is tuned for the UoM environment. It is not intended to be a generic cluster monitoring framework.
 
-## Install
+## Installation
 
-Clone the repo and run:
+Clone the repository and run:
 
 ```bash
 ./install.sh
 ```
 
-The installer:
+The installer will:
 
-- copies `bin/gpuq` into `~/bin/gpuq`
-- makes it executable
-- adds a shell wrapper to `~/.bashrc` if needed:
+- copy `bin/gpuq` to `~/bin/gpuq`
+- mark the script as executable
+- add a shell wrapper to `~/.bashrc` if one is not already present
+
+The wrapper is:
 
 ```bash
 gpuq() { bash "$HOME/bin/gpuq" "$@"; }
 ```
 
-That wrapper is intentional. On some HPC filesystems, direct execution from home directories is unreliable, while `bash ~/bin/gpuq` is stable.
+This is deliberate. On some HPC filesystems, direct execution from home directories can be unreliable, while `bash ~/bin/gpuq` is stable.
 
 After installation:
 
@@ -93,17 +91,29 @@ gpuq -n 3
 gpuq --view
 ```
 
-- `gpuq`: refresh every 5 seconds
-- `gpuq 3`: refresh every 3 seconds
-- `gpuq --view`: open one full snapshot in `less -R`
+- `gpuq` refreshes every 5 seconds
+- `gpuq 3` refreshes every 3 seconds
+- `gpuq -n 3` is equivalent to `gpuq 3`
+- `gpuq --view` opens a single full snapshot in `less -R`
+
+## Output Overview
+
+The live view is organized into three sections:
+
+1. Partition summary for `gpuL` and `gpuA`, including node states, running jobs, pending jobs, and a rough congestion label.
+2. Pending reason summary, grouped by partition.
+3. A `Your jobs` table followed by current `CPU / GPU` usage against quota.
+
+The congestion label is a heuristic derived from node states and pending job counts. It should be treated as an operational hint, not a scheduler guarantee.
 
 ## Design Notes
 
-- The live dashboard uses a compact, read-only refresh loop.
-- Input-heavy live interaction was intentionally removed because it was not reliable across different terminal frontends.
-- The redraw path clears each printed line explicitly so stale text does not remain on screen after shorter updates.
+- The live dashboard is intentionally read-only.
+- Previous input-heavy live interaction was removed because terminal behavior was inconsistent across frontends.
+- The redraw path clears each printed line explicitly to avoid stale text after shorter updates.
+- The dashboard aims to be informative while remaining light enough for shared login nodes.
 
-## Project Layout
+## Repository Layout
 
 ```text
 bin/gpuq        Main dashboard script
@@ -113,12 +123,14 @@ tests/smoke.sh  Minimal syntax and CLI smoke checks
 
 ## Smoke Test
 
+Run:
+
 ```bash
 ./tests/smoke.sh
 ```
 
-This validates shell syntax and a few safe non-interactive code paths.
+This performs shell syntax validation and a small set of safe non-interactive checks.
 
 ## License
 
-MIT
+Released under the MIT License.
