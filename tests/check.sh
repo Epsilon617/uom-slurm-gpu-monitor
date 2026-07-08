@@ -9,4 +9,4 @@ bash -n "${SCRIPT}"
 bash "${SCRIPT}" --help >/dev/null
 bash "${SCRIPT}" 3 --help >/dev/null 2>&1 || true
 
-printf 'smoke checks passed\n'
+printf 'checks passed\n'

@@ -57,6 +57,35 @@ tres_count_from_list() {
   fi
 }
 
+emit_gpu_type_counts_from_tres() {
+  local tres="${1:-}"
+  local token
+
+  [[ -n "$tres" && "$tres" != "N/A" ]] || return
+
+  local IFS=','
+  for token in $tres; do
+    token=${token//[[:space:]]/}
+    if [[ "$token" =~ ^gres/gpu:([^:=,]+)[=:]([0-9]+)$ ]]; then
+      printf '%s|%s\n' "${BASH_REMATCH[1]}" "${BASH_REMATCH[2]}"
+    elif [[ "$token" =~ ^gres/gpu=([0-9]+)$ ]]; then
+      printf 'gpu|%s\n' "${BASH_REMATCH[1]}"
+    fi
+  done
+}
+
+format_usage_item() {
+  local label="$1"
+  local used="$2"
+  local quota="${3:-?}"
+
+  if [[ "$quota" =~ ^[0-9]+$ ]]; then
+    printf '%s %s/%s' "$label" "$used" "$quota"
+  else
+    printf '%s %s' "$label" "$used"
+  fi
+}
+
 while [[ $# -gt 0 ]]; do
   case "$1" in
     -n|--interval)
@@ -100,7 +129,9 @@ done
 partitions_csv=$(IFS=,; echo "${PARTITIONS[*]}")
 quota_raw=$(sacctmgr show qos fatpou01,gpu-free format=Name,MaxTRESPU -Pn 2>/dev/null || true)
 cpu_quota='?'
+gpu_job_cpu_quota='?'
 gpu_quota='?'
+gpu_type_quota_pairs=''
 
 while IFS='|' read -r quota_name quota_tres; do
   case "$quota_name" in
@@ -109,8 +140,14 @@ while IFS='|' read -r quota_name quota_tres; do
       [[ -n "$cpu_quota_value" ]] && cpu_quota="$cpu_quota_value"
       ;;
     gpu-free)
+      gpu_job_cpu_quota_value=$(tres_count_from_list "$quota_tres" 'cpu')
+      [[ -n "$gpu_job_cpu_quota_value" ]] && gpu_job_cpu_quota="$gpu_job_cpu_quota_value"
       gpu_quota_value=$(tres_count_from_list "$quota_tres" 'gres/gpu')
       [[ -n "$gpu_quota_value" ]] && gpu_quota="$gpu_quota_value"
+      while IFS='|' read -r gpu_type gpu_limit; do
+        [[ -n "$gpu_type" && "$gpu_type" != "gpu" ]] || continue
+        gpu_type_quota_pairs+="${gpu_type}=${gpu_limit} "
+      done < <(emit_gpu_type_counts_from_tres "$quota_tres")
       ;;
   esac
 done <<< "$quota_raw"
@@ -319,8 +356,35 @@ apply_colors() {
         ." ".$gpu_color.$gpu_used.$ENV{PART_COLOR_RESET}
         ."/".$ENV{PART_COLOR_MUTED}.$gpu_quota.$ENV{PART_COLOR_RESET}
     }ex;
+    if (/^(Usage|GPU types)\s+/) {
+      s{\b([A-Za-z][A-Za-z0-9_-]*)\s+(\d+)/(\S+)}{
+        my ($label, $used, $quota) = ($1, $2, $3);
+        my $usage_color = $ENV{PART_COLOR_MUTED};
+        if ($quota =~ /^\d+$/ && $quota > 0) {
+          my $ratio = $used / $quota;
+          $usage_color =
+            $used == 0 ? $ENV{PART_COLOR_USAGE_ZERO} :
+            $ratio >= 1 ? $ENV{PART_COLOR_USAGE_FULL} :
+            $ratio >= 0.7 ? $ENV{PART_COLOR_USAGE_HIGH} :
+            $ENV{PART_COLOR_USAGE_LOW};
+        } elsif ($used == 0) {
+          $usage_color = $ENV{PART_COLOR_USAGE_ZERO};
+        }
+        $ENV{PART_COLOR_LABEL}.$label.$ENV{PART_COLOR_RESET}
+          ." ".$usage_color.$used.$ENV{PART_COLOR_RESET}
+          ."/".$ENV{PART_COLOR_MUTED}.$quota.$ENV{PART_COLOR_RESET}
+      }gex;
+      s{\b([A-Za-z][A-Za-z0-9_-]*)\s+(\d+)(?=(?:\s{2,}|$))}{
+        my ($label, $used) = ($1, $2);
+        my $usage_color = $used == 0 ? $ENV{PART_COLOR_USAGE_ZERO} : $ENV{PART_COLOR_USAGE_LOW};
+        $ENV{PART_COLOR_LABEL}.$label.$ENV{PART_COLOR_RESET}
+          ." ".$usage_color.$used.$ENV{PART_COLOR_RESET}
+      }gex;
+      s/^Usage\b/$ENV{PART_COLOR_MULTICORE}."Usage".$ENV{PART_COLOR_RESET}/e;
+      s/\bGPU types\b/$ENV{PART_COLOR_MULTICORE}."GPU types".$ENV{PART_COLOR_RESET}/ge;
+    }
     s/^(Showing all \d+ jobs|Showing jobs \d+-\d+ of \d+  scroll: .*)$/$ENV{PART_COLOR_MUTED}.$1.$ENV{PART_COLOR_RESET}/e;
-    s/^(Partition\s+Nodes\(total\)\s+Idle\s+Mix\s+Alloc\s+Drain\s+Down\s+Running jobs\s+Pending jobs\s+Rough status)(\s*)$/$ENV{PART_COLOR_TABLE_HEADER}.$1.$ENV{PART_COLOR_RESET}.$2/e;
+    s/^(Partition\s+Nodes\(total\)\s+Idle\s+Mix\s+Alloc\s+Drain\s+Down\s+Running jobs\s+Pending jobs\s+Estimated status)(\s*)$/$ENV{PART_COLOR_TABLE_HEADER}.$1.$ENV{PART_COLOR_RESET}.$2/e;
     s/^(JOBID\s+PARTITION\s+STATE\s+TIME\s+LIMIT\s+CPU\s+GPU\s+NODES\s+NODE\/REASON\s+NAME)(\s*)$/$ENV{PART_COLOR_TABLE_HEADER}.$1.$ENV{PART_COLOR_RESET}.$2/e;
     s{^(CPU|GPU)(\s+)(\d+)(\s+/\s+)(\S+)$}{
       my ($label, $space, $used, $sep, $quota) = ($1, $2, $3, $4, $5);
@@ -341,10 +405,36 @@ apply_colors() {
         .$sep
         .$ENV{PART_COLOR_MUTED}.$quota.$ENV{PART_COLOR_RESET}
     }ex;
+    s{^([A-Za-z][A-Za-z0-9 _-]*)(\s+)(\d+)(\s+/\s+)(\S+)$}{
+      my ($label, $space, $used, $sep, $quota) = ($1, $2, $3, $4, $5);
+      my $usage_color = $ENV{PART_COLOR_MUTED};
+      if ($quota =~ /^\d+$/ && $quota > 0) {
+        my $ratio = $used / $quota;
+        $usage_color =
+          $used == 0 ? $ENV{PART_COLOR_USAGE_ZERO} :
+          $ratio >= 1 ? $ENV{PART_COLOR_USAGE_FULL} :
+          $ratio >= 0.7 ? $ENV{PART_COLOR_USAGE_HIGH} :
+          $ENV{PART_COLOR_USAGE_LOW};
+      } elsif ($used == 0) {
+        $usage_color = $ENV{PART_COLOR_USAGE_ZERO};
+      }
+      $ENV{PART_COLOR_LABEL}.$label.$ENV{PART_COLOR_RESET}
+        .$space
+        .$usage_color.$used.$ENV{PART_COLOR_RESET}
+        .$sep
+        .$ENV{PART_COLOR_MUTED}.$quota.$ENV{PART_COLOR_RESET}
+    }ex;
+    s{^([A-Za-z][A-Za-z0-9 _-]*)(\s+)(\d+)$}{
+      my ($label, $space, $used) = ($1, $2, $3);
+      my $usage_color = $used == 0 ? $ENV{PART_COLOR_USAGE_ZERO} : $ENV{PART_COLOR_USAGE_LOW};
+      $ENV{PART_COLOR_LABEL}.$label.$ENV{PART_COLOR_RESET}
+        .$space
+        .$usage_color.$used.$ENV{PART_COLOR_RESET}
+    }ex;
     s/^[-]{8,}$/$ENV{PART_COLOR_DIVIDER}.$&.$ENV{PART_COLOR_RESET}/e;
     s/\brefresh=\d+s\b/$ENV{PART_COLOR_MUTED}.$&.$ENV{PART_COLOR_RESET}/ge;
     s/Ctrl-C to quit/$ENV{PART_COLOR_MUTED}."Ctrl-C to quit".$ENV{PART_COLOR_RESET}/ge;
-    s/^Note: rough status is node-level only\. A mix node may still have free GPUs\.$/$ENV{PART_COLOR_NOTE}.$&.$ENV{PART_COLOR_RESET}/e;
+    s/^Note: estimated status is node-level only\. A mix node may still have free GPUs\.$/$ENV{PART_COLOR_NOTE}.$&.$ENV{PART_COLOR_RESET}/e;
     s/\bvery crowded\b/__GPUQ_STATUS_VERY_CROWDED__/g;
     s/\bslightly busy\b/__GPUQ_STATUS_SLIGHTLY_BUSY__/g;
     s/\bno nodes\b/__GPUQ_STATUS_NO_NODES__/g;
@@ -404,6 +494,45 @@ line_count() {
   fi
 }
 
+max_line_width() {
+  local text="${1:-}"
+  if [[ -z "$text" ]]; then
+    printf '0'
+  else
+    printf '%s' "$text" | awk '{ if (length($0) > max) max = length($0) } END { print max + 0 }'
+  fi
+}
+
+make_divider() {
+  local width="$1"
+  printf '%*s' "$width" '' | tr ' ' '-'
+}
+
+format_pending_reasons_live() {
+  local part="$1"
+  local matches="$2"
+  local label_width="$3"
+  local label="[${part}]"
+  local item line sep count reason
+
+  if [[ -z "$matches" ]]; then
+    printf '%-*s 0  no pending jobs\n' "$label_width" "$label"
+    return
+  fi
+
+  line=$(printf '%-*s ' "$label_width" "$label")
+  sep=''
+
+  while IFS='|' read -r count reason; do
+    [[ -n "$count" ]] || continue
+    item="${count} ${reason}"
+    line+="${sep}${item}"
+    sep=', '
+  done <<< "$matches"
+
+  printf '%s\n' "$line"
+}
+
 drain_stdin() {
   local discard=''
 
@@ -443,25 +572,29 @@ trap 'restore_terminal' EXIT
 # Core render path
 render_once() {
   local now sinfo_raw squeue_raw queue_table user_jobs current_user frame divider divider_width summary_table user_tres_raw
-  local -A total idle mix alloc drain down running pending reason_counts job_gpus
+  local -A total idle mix alloc drain down running pending reason_counts job_gpus job_tres_alloc gpu_type_used
   local part nodes state usable total_n idle_n mix_n alloc_n drain_n down_n running_n pending_n status
   local jobid user partition job_state time_used time_limit node_count reason name key matches cpu_count gres_req gpu_count tres_jobid tres_alloc
-  local cpu_used gpu_used jobs_header jobs_footer user_jobs_table refresh_label control_hint
+  local cpu_only_used gpu_job_cpu_used gpu_used jobs_header jobs_footer user_jobs_table refresh_label control_hint
   local part_token running_token pending_token status_token
   local jobs_meta base_lines footer_lines header_lines term_lines end_line visible_rows idx visible_job_count
   local table_header_line reason_limit reason_total reason_hidden shown_matches
-  local frame_line_count extra_clear_lines
+  local frame_line_count extra_clear_lines pending_label_width pending_label panel_width terminal_cols jobs_divider jobs_divider_width user_jobs_width
+  local gpu_type gpu_type_count gpu_type_source gpu_type_pair gpu_type_quota gpu_type_usage_line typed_gpu_count
   local -a user_job_lines visible_job_lines frame_lines
   now=$(date '+%Y-%m-%d %H:%M:%S %Z')
   current_user=$(id -un)
-  divider_width=88
+  panel_width=114
+  divider_width="$panel_width"
   term_lines=40
   if [[ "$tty_mode" -eq 1 ]]; then
-    divider_width=$(tput cols 2>/dev/null || echo 88)
+    terminal_cols=$(tput cols 2>/dev/null || echo "$panel_width")
     term_lines=$(tput lines 2>/dev/null || echo 40)
-    if [[ "$divider_width" -gt 100 ]]; then
-      divider_width=100
-    elif [[ "$divider_width" -lt 48 ]]; then
+    if [[ "$terminal_cols" -lt "$panel_width" ]]; then
+      divider_width="$terminal_cols"
+    fi
+
+    if [[ "$divider_width" -lt 48 ]]; then
       divider_width=48
     fi
   fi
@@ -477,7 +610,14 @@ render_once() {
       reason_limit=4
     fi
   fi
-  divider=$(printf '%*s' "$divider_width" '' | tr ' ' '-')
+  divider=$(make_divider "$divider_width")
+  pending_label_width=0
+  for part in "${PARTITIONS[@]}"; do
+    pending_label="[${part}]"
+    if [[ "${#pending_label}" -gt "$pending_label_width" ]]; then
+      pending_label_width=${#pending_label}
+    fi
+  done
 
   sinfo_raw=$(sinfo -h -p "$partitions_csv" -o '%P|%D|%t' 2>&1)
   if [[ $? -ne 0 ]]; then
@@ -505,6 +645,7 @@ render_once() {
 
   while IFS='|' read -r tres_jobid tres_alloc; do
     [[ -n "$tres_jobid" ]] || continue
+    job_tres_alloc["$tres_jobid"]="$tres_alloc"
     job_gpus["$tres_jobid"]=$(gpu_count_from_tres "$tres_alloc")
   done <<< "$user_tres_raw"
 
@@ -559,7 +700,8 @@ render_once() {
     esac
   done <<< "$queue_table"
 
-  cpu_used=0
+  cpu_only_used=0
+  gpu_job_cpu_used=0
   gpu_used=0
   while IFS='|' read -r jobid user partition job_state time_used time_limit node_count reason name cpu_count gres_req; do
     [[ "$user" == "$current_user" && "$job_state" == "RUNNING" ]] || continue
@@ -570,30 +712,61 @@ render_once() {
     fi
     [[ "$cpu_count" =~ ^[0-9]+$ ]] || cpu_count=0
     [[ "$gpu_count" =~ ^[0-9]+$ ]] || gpu_count=0
-    cpu_used=$(( cpu_used + cpu_count ))
-    gpu_used=$(( gpu_used + gpu_count ))
+
+    if [[ "$gpu_count" -gt 0 ]]; then
+      gpu_job_cpu_used=$(( gpu_job_cpu_used + cpu_count ))
+      gpu_used=$(( gpu_used + gpu_count ))
+      gpu_type_source=${job_tres_alloc["$jobid"]:-$gres_req}
+      typed_gpu_count=0
+
+      while IFS='|' read -r gpu_type gpu_type_count; do
+        [[ -n "$gpu_type" && "$gpu_type" != "gpu" ]] || continue
+        [[ "$gpu_type_count" =~ ^[0-9]+$ ]] || continue
+        gpu_type_used["$gpu_type"]=$(( ${gpu_type_used["$gpu_type"]:-0} + gpu_type_count ))
+        typed_gpu_count=$(( typed_gpu_count + gpu_type_count ))
+      done < <(emit_gpu_type_counts_from_tres "$gpu_type_source")
+
+      if [[ "$typed_gpu_count" -eq 0 ]]; then
+        gpu_type_used["gpu"]=$(( ${gpu_type_used["gpu"]:-0} + gpu_count ))
+      fi
+    else
+      cpu_only_used=$(( cpu_only_used + cpu_count ))
+    fi
   done <<< "$squeue_raw"
+
+  gpu_type_usage_line=''
+  for gpu_type_pair in $gpu_type_quota_pairs; do
+    gpu_type=${gpu_type_pair%%=*}
+    gpu_type_quota=${gpu_type_pair#*=}
+    gpu_type_usage_line+="  $(format_usage_item "$gpu_type" "${gpu_type_used["$gpu_type"]:-0}" "$gpu_type_quota")"
+  done
+  if [[ "${gpu_type_used["gpu"]:-0}" -gt 0 ]]; then
+    gpu_type_usage_line+="  $(format_usage_item "gpu" "${gpu_type_used["gpu"]}" "?")"
+  fi
+  if [[ -n "$gpu_type_usage_line" ]]; then
+    gpu_type_usage_line="  GPU types${gpu_type_usage_line}"
+  fi
 
   summary_table=$({
     pad_right_rendered "Partition" 15
     printf ' '
     pad_left_rendered "Nodes(total)" 12
     printf ' '
-    pad_left_rendered "Idle" 5
+    pad_left_rendered "Idle" 6
     printf ' '
-    pad_left_rendered "Mix" 5
+    pad_left_rendered "Mix" 6
     printf ' '
-    pad_left_rendered "Alloc" 5
+    pad_left_rendered "Alloc" 6
     printf ' '
-    pad_left_rendered "Drain" 5
+    pad_left_rendered "Drain" 6
     printf ' '
-    pad_left_rendered "Down" 5
+    pad_left_rendered "Down" 6
     printf ' '
-    pad_left_rendered "Running jobs" 12
+    pad_left_rendered "Running jobs" 13
     printf ' '
-    pad_left_rendered "Pending jobs" 12
+    pad_left_rendered "Pending jobs" 13
     printf '  '
-    pad_right_rendered "Rough status" 14
+    pad_right_rendered "Estimated status" 16
     printf '\n'
 
     for part in "${PARTITIONS[@]}"; do
@@ -656,21 +829,21 @@ render_once() {
       printf ' '
       pad_left_rendered "$total_n" 12
       printf ' '
-      pad_left_rendered "$idle_n" 5
+      pad_left_rendered "$idle_n" 6
       printf ' '
-      pad_left_rendered "$mix_n" 5
+      pad_left_rendered "$mix_n" 6
       printf ' '
-      pad_left_rendered "$alloc_n" 5
+      pad_left_rendered "$alloc_n" 6
       printf ' '
-      pad_left_rendered "$drain_n" 5
+      pad_left_rendered "$drain_n" 6
       printf ' '
-      pad_left_rendered "$down_n" 5
+      pad_left_rendered "$down_n" 6
       printf ' '
-      pad_left_rendered "$running_n" 12 "$running_token"
+      pad_left_rendered "$running_n" 13 "$running_token"
       printf ' '
-      pad_left_rendered "$pending_n" 12 "$pending_token"
+      pad_left_rendered "$pending_n" 13 "$pending_token"
       printf '  '
-      pad_right_rendered "$status" 14 "$status_token"
+      pad_right_rendered "$status" 16 "$status_token"
       printf '\n'
     done
   })
@@ -695,13 +868,7 @@ render_once() {
     )
 
     if [[ "$tty_mode" -eq 1 && "$mode" == "live" ]]; then
-      if [[ -n "$matches" ]]; then
-        shown_matches="$matches"
-        shown_matches=$(printf '%s\n' "$shown_matches" | awk -F'|' '{ parts[NR] = $1 " " $2 } END { for (i = 1; i <= NR; i++) { printf "%s%s", parts[i], (i < NR ? ", " : "") } }')
-        frame+="[${part}] ${shown_matches}"$'\n'
-      else
-        frame+="[${part}] 0  no pending jobs"$'\n'
-      fi
+      frame+="$(format_pending_reasons_live "$part" "$matches" "$pending_label_width")"$'\n'
     elif [[ -n "$matches" ]]; then
       frame+="[${part}]"$'\n'
       reason_total=$(printf '%s\n' "$matches" | awk 'END { print NR }')
@@ -746,7 +913,7 @@ render_once() {
 
     table_header_line="${user_job_lines[0]}"
     if [[ "$tty_mode" -eq 1 && "$mode" == "live" ]]; then
-      jobs_footer=$'\n'"$divider"$'\n'"Usage  CPU ${cpu_used}/${cpu_quota}  GPU ${gpu_used}/${gpu_quota}"$'\n'
+      jobs_footer=$'\n'"$divider"$'\n'"Usage  $(format_usage_item "CPU-only" "$cpu_only_used" "$cpu_quota")  $(format_usage_item "GPU-CPU" "$gpu_job_cpu_used" "$gpu_job_cpu_quota")  $(format_usage_item "GPU-total" "$gpu_used" "$gpu_quota")${gpu_type_usage_line}"$'\n'
 
       footer_lines=$(line_count "$jobs_footer")
       base_lines=$(line_count "$frame")
@@ -789,11 +956,27 @@ render_once() {
     user_jobs_table="No jobs found for ${current_user}."
   fi
 
+  user_jobs_width=$(max_line_width "$user_jobs_table")
+  jobs_divider_width="$divider_width"
+  if [[ "$user_jobs_width" -gt "$jobs_divider_width" ]]; then
+    jobs_divider_width="$user_jobs_width"
+  fi
+  jobs_divider=$(make_divider "$jobs_divider_width")
+  jobs_header="${jobs_divider}"$'\n'"Your jobs (${current_user})"$'\n'
+
+  if [[ "$tty_mode" -eq 1 && "$mode" == "live" ]]; then
+    jobs_footer=$'\n'"$jobs_divider"$'\n'"Usage  $(format_usage_item "CPU-only" "$cpu_only_used" "$cpu_quota")  $(format_usage_item "GPU-CPU" "$gpu_job_cpu_used" "$gpu_job_cpu_quota")  $(format_usage_item "GPU-total" "$gpu_used" "$gpu_quota")${gpu_type_usage_line}"$'\n'
+  fi
+
   if [[ -z "${jobs_footer:-}" ]]; then
-    jobs_footer=$'\n'"$divider"$'\n'"Current usage / quota"$'\n'
-    jobs_footer+="CPU  ${cpu_used} / ${cpu_quota}"$'\n'
-    jobs_footer+="GPU  ${gpu_used} / ${gpu_quota}"$'\n'
-    jobs_footer+=$'\n'"${divider}"$'\n''Note: rough status is node-level only. A mix node may still have free GPUs.'$'\n'
+    jobs_footer=$'\n'"$jobs_divider"$'\n'"Current usage / quota"$'\n'
+    jobs_footer+="CPU-only     $(format_usage_item "" "$cpu_only_used" "$cpu_quota")"$'\n'
+    jobs_footer+="GPU-job CPU  $(format_usage_item "" "$gpu_job_cpu_used" "$gpu_job_cpu_quota")"$'\n'
+    jobs_footer+="GPU-total    $(format_usage_item "" "$gpu_used" "$gpu_quota")"$'\n'
+    if [[ -n "$gpu_type_usage_line" ]]; then
+      jobs_footer+="${gpu_type_usage_line#  }"$'\n'
+    fi
+    jobs_footer+=$'\n'"${jobs_divider}"$'\n''Note: estimated status is node-level only. A mix node may still have free GPUs.'$'\n'
   fi
 
   frame+="$jobs_header"
