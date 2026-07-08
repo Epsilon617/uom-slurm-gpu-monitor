@@ -2,7 +2,7 @@
 
 `gpuq` is a lightweight Slurm dashboard for the University of Manchester HPC environment. It gives users a compact live view of GPU queue pressure, pending reasons, personal jobs, and current CPU and GPU usage.
 
-![Preview](assert/preview.png)
+![Preview](assets/preview.png)
 
 ## Features
 
