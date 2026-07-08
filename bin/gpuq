@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
 
 # UoM Slurm GPU Monitor
-# Live Slurm summary for gpuL/gpuA plus the current user's job table.
+# Live Slurm summary for selected partitions plus the current user's job table.
 
 set -u
 
 DEFAULT_INTERVAL=5
-PARTITIONS=("gpuL" "gpuA")
+PARTITIONS=("gpuL" "gpuA" "multicore" "multicore_small")
 
 interval="$DEFAULT_INTERVAL"
 mode="live"
@@ -265,7 +265,7 @@ apply_colors() {
     s/\bgpuA\b/$ENV{PART_COLOR_GPUA}."gpuA".$ENV{PART_COLOR_RESET}/ge;
     s/\bgpuL\b/$ENV{PART_COLOR_GPUL}."gpuL".$ENV{PART_COLOR_RESET}/ge;
     s/\bgpuH\b/$ENV{PART_COLOR_GPUH}."gpuH".$ENV{PART_COLOR_RESET}/ge;
-    s/\b(multicore(?:_\w+)*)\b/$ENV{PART_COLOR_MULTICORE}.$1.$ENV{PART_COLOR_RESET}/ge;
+    s/\b(multicore(?:[-_]\w+)*)\b/$ENV{PART_COLOR_MULTICORE}.$1.$ENV{PART_COLOR_RESET}/ge;
     s/\b(serial(?:_\w+)*)\b/$ENV{PART_COLOR_SERIAL}.$1.$ENV{PART_COLOR_RESET}/ge;
     s/\bRUNNING\b/$ENV{PART_COLOR_RUNNING}."RUNNING".$ENV{PART_COLOR_RESET}/ge;
     s/\bPENDING\b/$ENV{PART_COLOR_PENDING}."PENDING".$ENV{PART_COLOR_RESET}/ge;
@@ -512,7 +512,7 @@ render_once() {
     [[ -n "$part" ]] || continue
     part=${part%%\**}
     case "$part" in
-      gpuL|gpuA) ;;
+      gpuL|gpuA|multicore|multicore_small) ;;
       *) continue ;;
     esac
 
@@ -529,7 +529,21 @@ render_once() {
     esac
   done <<< "$sinfo_raw"
 
-  queue_table=$(printf '%s\n' "$squeue_raw" | awk -F'|' '$3 == "gpuL" || $3 == "gpuA" { print }')
+  queue_table=$(printf '%s\n' "$squeue_raw" | awk -F'|' -v partitions="$partitions_csv" '
+    BEGIN {
+      split(partitions, parts, ",")
+      for (idx in parts) {
+        wanted[parts[idx]] = 1
+      }
+    }
+    {
+      partition = $3
+      sub(/\*.*/, "", partition)
+      if (partition in wanted) {
+        print
+      }
+    }
+  ')
 
   while IFS='|' read -r jobid user partition job_state time_used time_limit node_count reason name cpu_count gres_req; do
     [[ -n "$partition" ]] || continue
@@ -561,7 +575,7 @@ render_once() {
   done <<< "$squeue_raw"
 
   summary_table=$({
-    pad_right_rendered "Partition" 11
+    pad_right_rendered "Partition" 15
     printf ' '
     pad_left_rendered "Nodes(total)" 12
     printf ' '
@@ -638,7 +652,7 @@ render_once() {
         status_token="$status"
       fi
 
-      pad_right_rendered "$part" 11 "$part_token"
+      pad_right_rendered "$part" 15 "$part_token"
       printf ' '
       pad_left_rendered "$total_n" 12
       printf ' '
